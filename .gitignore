@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pcap
+*.pcapng
+.venv/
+venv/
+*.log
