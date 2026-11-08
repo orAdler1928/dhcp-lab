@@ -30,6 +30,12 @@ class StarvationAttack(BaseAttack):
         self._pending = {}
         self._last_offer_at = None
         self._active_leases = {}  # Maps mac -> {ip, server, lease_time, acquired_at (monotonic)}
+        # Separate from self.stopped on purpose: self.stopped only becomes
+        # True on Ctrl+C (the whole attack ending), but maintenance mode is
+        # meant to keep running after land-grab finishes, with self.stopped
+        # still False. This flag marks "land-grab is over, stop chasing new
+        # OFFERs with REQUESTs" independently of that.
+        self._land_grab_done = False
 
     def _land_grab(self):
         while not self.stopped:
@@ -108,6 +114,7 @@ class StarvationAttack(BaseAttack):
         sniff_thread.start()
 
         self._land_grab()
+        self._land_grab_done = True
 
         if self.maintain:
             self.logger.info("Entering maintenance mode — renewing leases until Ctrl+C")
@@ -173,6 +180,16 @@ class StarvationAttack(BaseAttack):
         if msg_type == 2:  # OFFER
             self.stats["offer_received"] += 1
             self._last_offer_at = time.monotonic()
+            if self._land_grab_done:
+                # _land_grab already finished (e.g. hit --max-leases), but
+                # DISCOVERs already in flight before that point can still
+                # earn an OFFER here, from the independent sniff thread.
+                # Don't chase it with a REQUEST — otherwise more leases get
+                # captured (and later maintained) than --max-leases asked
+                # for. Still count it in offer_received above, since the
+                # OFFER itself is a true observation.
+                self.logger.debug("Ignoring late OFFER (land-grab already done) — xid=%s", hex(xid))
+                return
             offered_ip = packet[BOOTP].yiaddr
             server_ip = packet[IP].src
             mac_bytes = packet[BOOTP].chaddr[:6]
