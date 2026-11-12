@@ -2,11 +2,13 @@
 import argparse
 import logging
 
+from attacks.decline import DeclineFloodAttack
 from common.logging_config import setup_logging
 from attacks.starvation import StarvationAttack
 
 ATTACKS = {
     "starvation": StarvationAttack,
+    "decline": DeclineFloodAttack,
 }
 
 

