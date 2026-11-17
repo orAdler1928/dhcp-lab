@@ -5,10 +5,12 @@ import logging
 from attacks.decline import DeclineFloodAttack
 from common.logging_config import setup_logging
 from attacks.starvation import StarvationAttack
+from attacks.release import ReleaseAttack
 
 ATTACKS = {
     "starvation": StarvationAttack,
     "decline": DeclineFloodAttack,
+    "release": ReleaseAttack, 
 }
 
 
