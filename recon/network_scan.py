@@ -34,7 +34,7 @@ def scan_subnet(iface, subnet_str=None, timeout=3) -> list[dict]:
     subnet_str = get_interface_subnet(iface)
     if not subnet_str:
       print(f"[-] Could not auto-detect subnet for interface {iface}")
-      return []
+      raise RuntimeError(f"Could not auto-detect subnet for interface {iface}")
     print(f"[*] Auto-detected subnet: {subnet_str}")
 
   packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet_str)
@@ -44,4 +44,7 @@ def scan_subnet(iface, subnet_str=None, timeout=3) -> list[dict]:
   for sent, rcv in answered:
     devices.append({"ip": rcv.psrc, "mac": rcv.hwsrc})
 
+  if not devices:
+    print(f"[-] No devices found on subnet {subnet_str}")
+    raise RuntimeError(f"No devices found on subnet {subnet_str}")
   return devices

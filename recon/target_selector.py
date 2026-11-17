@@ -7,22 +7,16 @@ except ImportError:
 
 
 def select_device(devices, server_ip, my_ip=None):
-  server_mac = None
   candidates = []
 
   for d in devices:
-    if d["ip"] == server_ip:
-      server_mac = d["mac"]
-    elif d["ip"] != my_ip:
+    if d["ip"] != my_ip and d["ip"] != server_ip:
       candidates.append(d)
 
-  if server_mac is None:
-    print(f"[-] Server {server_ip} not found in scan results")
-    return None
 
   if not candidates:
     print("[-] No other devices found on the network")
-    return None
+    raise RuntimeError("No other devices found on the network")
 
   selected = None
 
@@ -41,7 +35,7 @@ def select_device(devices, server_ip, my_ip=None):
 
     if selected is None:
       print("[-] Selection cancelled.")
-      return None
+      raise RuntimeError("Selection cancelled")
 
   else:
     print("\nAvailable devices:")
@@ -61,5 +55,4 @@ def select_device(devices, server_ip, my_ip=None):
   return {
       "target_ip": selected["ip"],
       "target_mac": selected["mac"],
-      "server_mac": server_mac,
   }
