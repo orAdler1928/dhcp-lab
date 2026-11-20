@@ -1,7 +1,7 @@
 from common.packet_utils import random_mac, random_xid, mac_str_to_bytes
 from scapy.all import Ether, IP, UDP, BOOTP, DHCP, srp1
 
-def find_dhcp_server(iface, timeout=3):
+def find_dhcp_server(iface, timeout=5):
     mac = random_mac()
     xid = random_xid()
     discover_pkt = (
